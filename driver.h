@@ -18,8 +18,6 @@
 #include <linux/pci.h>
 #include <linux/uaccess.h>
 
-static_assert (PCIBIOS_SUCCESSFUL == 0);
-
 /**
  * enum pci_device_id_e - Kind of the diagnostic device.
  * @DIAG_START: enum start marker
@@ -32,6 +30,7 @@ enum diag_dev_kind_t {
 
 	DIAG_HDA = DIAG_START,
 	DIAG_DSP,
+	DIAG_MB,
 
 	DIAG_COUNT
 };

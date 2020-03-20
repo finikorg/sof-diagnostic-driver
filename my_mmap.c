@@ -15,10 +15,12 @@ int simple_remap_mmap(struct file *filp, struct vm_area_struct *vma)
 	int ret;
 	unsigned long size = vma->vm_end - vma->vm_start;
 
-	pr_info("[SOF] (re)mapping memory to user space; start address = %lu, physical address = %lu, size = %lu",
-			vma->vm_start, vma->vm_pgoff, size);
+	pr_info("[SOF] (re)mapping memory to user space; start address = 0x%lx,"
+		" pfn = 0x%lx, size = 0x%lx",
+		vma->vm_start, vma->vm_pgoff, size);
+
 	ret = remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff, size,
-			PAGE_SHARED);
+			      PAGE_SHARED);
 	describe_retval(ret, 0, "(re)mapping file");
 	return ret;
 }

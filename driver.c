@@ -8,15 +8,19 @@
 //  Author: Marcin Zielinski <marcinx.zielinski@linux.intel.com>
 //
 
+#define DEBUG
+
 #include "driver.h"
 #include "ioctl.h"
 #include "my_mmap.h"
 
 #include <linux/cdev.h>
+#include <linux/kfifo.h>
 #include <linux/fs.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/vmalloc.h>
+#include <linux/pci.h>
 #include <uapi/linux/fs.h>
 
 /**
@@ -801,11 +805,12 @@ static inline int get_pci_addr(void)
  *
  * Return: 0 on success, negative value on error.
  */
-static int setup_cdev(struct cdev *dev, int major, int minor)
+static int setup_cdev(struct cdev *dev, int major, int minor,
+		      const struct file_operations *fops)
 {
-	cdev_init(dev, &fops);
+	cdev_init(dev, fops);
 	dev->owner = THIS_MODULE;
-	dev->ops = &fops;
+	dev->ops = fops;
 	return cdev_add(dev, MKDEV(major, minor), 1);
 }
 
@@ -815,7 +820,8 @@ static int setup_cdev(struct cdev *dev, int major, int minor)
  *
  * Return: 0 on success, negative value on error.
  */
-static inline int setup_cdev_drv(enum diag_dev_kind_t dev_kind)
+static inline int setup_cdev_drv(enum diag_dev_kind_t dev_kind,
+				 const struct file_operations *fops)
 {
 	if (dev_kind < DIAG_START || dev_kind >= DIAG_COUNT) {
 		pr_err("[SOF] invalid device kind = %d", dev_kind);
@@ -823,7 +829,7 @@ static inline int setup_cdev_drv(enum diag_dev_kind_t dev_kind)
 	}
 
 	return setup_cdev(&driver.devices[dev_kind].mcdev,
-		MAJOR(driver.dev_num), MINOR(driver.dev_num) + dev_kind);
+		MAJOR(driver.dev_num), MINOR(driver.dev_num) + dev_kind, fops);
 }
 
 /**
@@ -919,13 +925,13 @@ int diagdev_init(void)
 		goto release_chrdev_region;
 	}
 
-	ret = setup_cdev_drv(DIAG_HDA);
+	ret = setup_cdev_drv(DIAG_HDA, &fops);
 	if (ret != 0) {
 		dev_crit(&pci_dev->dev, "unable to add HDA device to system");
 		goto destroy_class;
 	}
 
-	ret = setup_cdev_drv(DIAG_DSP);
+	ret = setup_cdev_drv(DIAG_DSP, &fops);
 	if (ret != 0) {
 		dev_crit(&pci_dev->dev, "unable to add DSP device to system");
 		goto release_cdev_hda;
@@ -945,6 +951,9 @@ int diagdev_init(void)
 
 	ret = pci_wconf16_chk(pci_dev, PCI_COMMAND,
 		PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+
+	pci_set_master(pci_dev);
+
 	pci_dev_put(pci_dev);
 	if (ret == 0)
 		goto final;
@@ -1002,5 +1011,806 @@ MODULE_AUTHOR("Intel");
 MODULE_DESCRIPTION("Diagnostic HDA Driver");
 MODULE_LICENSE("GPL");
 
+/*
 module_init(diagdev_init);
 module_exit(diagdev_exit);
+*/
+
+/**
+ * IMP Mailbox driver
+ */
+
+#define SOF_HDA_LLCH			0x14
+#define SOF_HDA_INTCTL			0x20
+#define SOF_HDA_INTSTS			0x24
+
+/* SOF_HDA_INTSTS regs */
+#define SOF_HDA_INTSTS_GIS		BIT(31)
+
+/* SOF_HDA_INCTL regs */
+#define SOF_HDA_INT_GLOBAL_EN		BIT(31)
+#define SOF_HDA_INT_CTRL_EN		BIT(30)
+#define SOF_HDA_INT_ALL_STREAM		0xff
+
+/* Intel HD Audio General DSP Registers */
+#define HDA_DSP_GEN_BASE		0x0
+#define HDA_DSP_REG_ADSPIC		(HDA_DSP_GEN_BASE + 0x08)
+#define HDA_DSP_REG_ADSPIS		(HDA_DSP_GEN_BASE + 0x0C)
+
+#define HDA_DSP_ADSPIC_IPC		1
+#define HDA_DSP_ADSPIS_IPC		1
+
+/* Intel HD Audio Inter-Processor Communication Registers */
+#define HDA_DSP_IPC_BASE		0x40
+#define HDA_DSP_REG_HIPCCTL		(HDA_DSP_IPC_BASE + 0x10)
+#define HDA_DSP_REG_HIPCT		(HDA_DSP_IPC_BASE + 0x00)
+#define HDA_DSP_REG_HIPCTE		(HDA_DSP_IPC_BASE + 0x04)
+#define HDA_DSP_REG_HIPCI		(HDA_DSP_IPC_BASE + 0x08)
+#define HDA_DSP_REG_HIPCIE		(HDA_DSP_IPC_BASE + 0x0C)
+
+/* HIPCCTL */
+#define HDA_DSP_REG_HIPCCTL_DONE	BIT(1)
+#define HDA_DSP_REG_HIPCCTL_BUSY	BIT(0)
+
+/*  HIPCI */
+#define HDA_DSP_REG_HIPCI_BUSY		BIT(31)
+#define HDA_DSP_REG_HIPCI_MSG_MASK	0x7FFFFFFF
+
+/* HIPCIE */
+#define HDA_DSP_REG_HIPCIE_DONE		BIT(30)
+#define HDA_DSP_REG_HIPCIE_MSG_MASK	0x3FFFFFFF
+
+/* HIPCT */
+#define HDA_DSP_REG_HIPCT_BUSY		BIT(31)
+#define HDA_DSP_REG_HIPCT_MSG_MASK	0x7FFFFFFF
+
+/* HIPCTE */
+#define HDA_DSP_REG_HIPCTE_MSG_MASK	0x3FFFFFFF
+
+#define HDA_DSP_HDA_BAR			0
+#define HDA_DSP_PP_BAR			1
+#define HDA_DSP_BAR			4
+
+#define SOF_HDA_MAX_CAPS		10
+#define SOF_HDA_CAP_ID_OFF		16
+#define SOF_HDA_CAP_ID_MASK		GENMASK(SOF_HDA_CAP_ID_OFF + 11,\
+						SOF_HDA_CAP_ID_OFF)
+#define SOF_HDA_CAP_NEXT_MASK		0xFFFF
+
+#define SOF_HDA_PP_CAP_ID		0x3
+
+#define SOF_HDA_REG_PP_PPCTL		0x04
+
+#define SOF_HDA_PPCTL_PIE		BIT(31)
+#define SOF_HDA_PPCTL_GPROCEN		BIT(30)
+
+
+/* ADSP data structure for mem and irq */
+struct adsp_data {
+	struct device *dev;
+	unsigned irq;
+	void __iomem *bar[6];
+
+	struct cdev mb_cdev;
+	struct kfifo tx_fifo;
+	struct kfifo rx_fifo;
+
+	wait_queue_head_t rx_fifo_not_empty;
+	wait_queue_head_t tx_fifo_not_full;
+
+	struct work_struct writer_work;
+};
+
+/**
+ * DSP register access helpers
+ */
+
+static void dsp_write(struct adsp_data *adsp_data, u32 bar_no, u32 offset,
+		      u32 value)
+{
+	writel(value, adsp_data->bar[bar_no] + offset);
+}
+
+static u32 dsp_read(struct adsp_data *adsp_data, u32 bar_no, u32 offset)
+{
+	return readl(adsp_data->bar[bar_no] + offset);
+}
+
+static bool dsp_update_bits(struct adsp_data *adsp_data, u32 bar_no, u32 offset,
+			    u32 mask, u32 value)
+{
+	unsigned int old, new;
+	u32 ret;
+
+	ret = dsp_read(adsp_data, bar_no, offset);
+
+	old = ret;
+	new = (old & ~mask) | (value & mask);
+
+	if (old == new)
+		return false;
+
+	dsp_write(adsp_data, bar_no, offset, new);
+
+	return true;
+}
+
+static void dsp_update_bits_forced(struct adsp_data *adsp_data, u32 bar_no,
+				   u32 offset, u32 mask, u32 value)
+{
+	unsigned int old, new;
+	u32 ret;
+
+	ret = dsp_read(adsp_data, bar_no, offset);
+
+	old = ret;
+	new = (old & ~mask) | (value & mask);
+
+	dsp_write(adsp_data, bar_no, offset, new);
+}
+
+/* Mailbox shared memory helpers */
+
+#define MBOX_UPLINK_OFFSET	0x81000
+#define MBOX_DOWNLINK_OFFSET	0xa0000
+
+/* Write to DSP mailbox shared memory */
+static void mailbox_write(struct adsp_data *adsp_data, void *data, size_t len)
+{
+	void __iomem *dest = adsp_data->bar[HDA_DSP_BAR] + MBOX_DOWNLINK_OFFSET;
+
+	memcpy_toio(dest, data, len);
+}
+
+/* Read from DSP mailbox shared memory */
+static void mailbox_read(struct adsp_data *adsp_data, void *data, size_t len)
+{
+	void __iomem *src = adsp_data->bar[HDA_DSP_BAR] + MBOX_UPLINK_OFFSET;
+
+	memcpy_fromio(data, src, len);
+}
+
+static int ipm_write(struct adsp_data *adsp_data, void *data, size_t len)
+{
+	mailbox_write(adsp_data, data, len);
+
+	/* Doorbell mechanism */
+	dsp_write(adsp_data, HDA_DSP_BAR, HDA_DSP_REG_HIPCI,
+		  HDA_DSP_REG_HIPCI_BUSY);
+
+	return 0;
+}
+
+static void dsp_ctrl_ppcap_enable(struct adsp_data *adsp_data, bool enable)
+{
+	u32 val = enable ? SOF_HDA_PPCTL_GPROCEN : 0;
+
+	dsp_update_bits(adsp_data, HDA_DSP_PP_BAR, SOF_HDA_REG_PP_PPCTL,
+			SOF_HDA_PPCTL_GPROCEN, val);
+}
+
+static void dsp_ctrl_ppcap_int_enable(struct adsp_data *adsp_data, bool enable)
+{
+	u32 val	= enable ? SOF_HDA_PPCTL_PIE : 0;
+
+	dsp_update_bits(adsp_data, HDA_DSP_PP_BAR, SOF_HDA_REG_PP_PPCTL,
+			SOF_HDA_PPCTL_PIE, val);
+}
+
+/*
+ * Simple interface with the driver through sysfs
+ */
+
+/* FIXME remove */
+static void enable_interrupts(struct adsp_data *adsp_data);
+
+/* Used to enable interrupts after loading firmware disables it */
+static ssize_t show_test_init(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct adsp_data *adsp_data = dev_get_drvdata(dev);
+
+	dev_dbg(dev, "%s", __func__);
+
+	enable_interrupts(adsp_data);
+
+	return sprintf(buf, "Now IPC interrupts are enabled\n");
+}
+
+static ssize_t __used store_test_init(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf,
+				      size_t count)
+{
+	struct adsp_data *adsp_data = dev_get_drvdata(dev);
+
+	dev_dbg(dev, "%s", __func__);
+
+	enable_interrupts(adsp_data);
+
+	return count;
+}
+
+static DEVICE_ATTR(test_init, 0600, show_test_init, store_test_init);
+
+/*
+ * At the moment only used for SOF_HDA_PP_CAP_ID
+ */
+static void get_caps(struct adsp_data *adsp_data)
+{
+	struct device *dev = adsp_data->dev;
+	u32 cap, offset, feature;
+	int count = 0;
+
+	offset = dsp_read(adsp_data, HDA_DSP_HDA_BAR, SOF_HDA_LLCH);
+
+	do {
+		cap = dsp_read(adsp_data, HDA_DSP_HDA_BAR, offset);
+		dev_dbg(dev, "checking for capabilities at 0x%x",
+			offset & SOF_HDA_CAP_NEXT_MASK);
+
+		feature = (cap & SOF_HDA_CAP_ID_MASK) >> SOF_HDA_CAP_ID_OFF;
+
+		dev_dbg(dev, "offset 0x%x cap 0x%x feature 0x%x",
+			offset, cap, feature);
+
+		switch (feature) {
+		case SOF_HDA_PP_CAP_ID:
+			dev_dbg(dev, "found DSP capability at 0x%x", offset);
+			adsp_data->bar[HDA_DSP_PP_BAR] =
+				adsp_data->bar[HDA_DSP_HDA_BAR] + offset;
+			break;
+		default:
+			dev_dbg(dev, "found capability %d at 0x%x",
+				feature, offset);
+			break;
+		}
+
+		offset = cap & SOF_HDA_CAP_NEXT_MASK;
+	} while (count++ <= SOF_HDA_MAX_CAPS && offset);
+}
+
+static void enable_interrupts(struct adsp_data *adsp_data)
+{
+	/* clear interrupt status register */
+	dsp_write(adsp_data, HDA_DSP_HDA_BAR, SOF_HDA_INTSTS,
+		  SOF_HDA_INT_CTRL_EN | SOF_HDA_INT_ALL_STREAM);
+
+	/* enable CIE and GIE interrupts */
+	dsp_update_bits(adsp_data, HDA_DSP_HDA_BAR, SOF_HDA_INTCTL,
+			SOF_HDA_INT_CTRL_EN | SOF_HDA_INT_GLOBAL_EN,
+			SOF_HDA_INT_CTRL_EN | SOF_HDA_INT_GLOBAL_EN);
+
+	/* enable IPC DONE and BUSY interrupts */
+	dsp_update_bits(adsp_data, HDA_DSP_BAR, HDA_DSP_REG_HIPCCTL,
+			HDA_DSP_REG_HIPCCTL_DONE | HDA_DSP_REG_HIPCCTL_BUSY,
+			HDA_DSP_REG_HIPCCTL_DONE | HDA_DSP_REG_HIPCCTL_BUSY);
+
+	/* enable IPC interrupt */
+	dsp_update_bits(adsp_data, HDA_DSP_BAR, HDA_DSP_REG_ADSPIC,
+			HDA_DSP_ADSPIC_IPC, HDA_DSP_ADSPIC_IPC);
+
+	get_caps(adsp_data);
+
+	dsp_ctrl_ppcap_enable(adsp_data, true);
+	dsp_ctrl_ppcap_int_enable(adsp_data, true);
+}
+
+static irqreturn_t interrupt_handler(int irq, void *context)
+{
+	struct adsp_data *adsp_data = context;
+	struct device *dev = adsp_data->dev;
+
+	dev_dbg(dev, "IRQ %d STS %x", irq, dsp_read(adsp_data, HDA_DSP_HDA_BAR,
+						    SOF_HDA_INTSTS));
+
+	/*
+	 * Get global interrupt status (GIS). It includes all hardware interrupt
+	 * sources.
+	 */
+	if (dsp_read(adsp_data, HDA_DSP_HDA_BAR, SOF_HDA_INTSTS) &
+	    SOF_HDA_INTSTS_GIS) {
+		/* Disable GIE interrupt */
+		dsp_update_bits(adsp_data, HDA_DSP_HDA_BAR, SOF_HDA_INTCTL,
+				SOF_HDA_INT_GLOBAL_EN, 0);
+
+		return IRQ_WAKE_THREAD;
+	}
+
+	return IRQ_NONE;
+}
+
+/* Receive and Send buffer size */
+static int fifo_size = 256;
+
+/* Mailbox slot len */
+static int mb_slot_len = 4;
+
+static void clear_dsp_busy(struct adsp_data *adsp_data)
+{
+	/*
+	 * Tell DSP cmd is done - clear busy
+	 * interrupt and send reply msg to dsp
+	 */
+	dsp_update_bits_forced(adsp_data, HDA_DSP_BAR,
+			       HDA_DSP_REG_HIPCT,
+			       HDA_DSP_REG_HIPCT_BUSY,
+			       HDA_DSP_REG_HIPCT_BUSY);
+
+	/* Unmask BUSY interrupt */
+	dsp_update_bits(adsp_data, HDA_DSP_BAR,
+			HDA_DSP_REG_HIPCCTL,
+			HDA_DSP_REG_HIPCCTL_BUSY,
+			HDA_DSP_REG_HIPCCTL_BUSY);
+}
+
+static void clear_dsp_done(struct adsp_data *adsp_data)
+{
+	/*
+	 * Enable more DONE interrupts to the host
+	 */
+	dsp_update_bits_forced(adsp_data, HDA_DSP_BAR,
+			       HDA_DSP_REG_HIPCIE,
+			       HDA_DSP_REG_HIPCIE_DONE,
+			       HDA_DSP_REG_HIPCIE_DONE);
+
+	/* Unmask Done interrupt */
+	dsp_update_bits(adsp_data, HDA_DSP_BAR,
+			HDA_DSP_REG_HIPCCTL,
+			HDA_DSP_REG_HIPCCTL_DONE,
+			HDA_DSP_REG_HIPCCTL_DONE);
+}
+
+static irqreturn_t ipc_irq_thread(int irq, void *context)
+{
+	struct adsp_data *adsp_data = context;
+	struct device *dev = adsp_data->dev;
+	u32 hipci, hipcie, hipct, hipcte;
+	u32 msg, msg_ext;
+
+	hipcie = dsp_read(adsp_data, HDA_DSP_BAR, HDA_DSP_REG_HIPCIE);
+	hipct = dsp_read(adsp_data, HDA_DSP_BAR, HDA_DSP_REG_HIPCT);
+	hipci = dsp_read(adsp_data, HDA_DSP_BAR, HDA_DSP_REG_HIPCI);
+	hipcte = dsp_read(adsp_data, HDA_DSP_BAR, HDA_DSP_REG_HIPCTE);
+
+	dev_dbg(dev, "hipci 0x%x, hipcie 0x%x, hipct 0x%x, hipcte 0x%x",
+		hipci, hipcie, hipct, hipcte);
+
+	/* Is this a reply message from the DSP, target BUSY is cleared
+	 * indicating that we can send more data
+	 */
+	if (hipcie & HDA_DSP_REG_HIPCIE_DONE) {
+		msg = hipci & HDA_DSP_REG_HIPCI_MSG_MASK;
+		msg_ext = hipcie & HDA_DSP_REG_HIPCIE_MSG_MASK;
+
+		dev_dbg(dev, "Reply from DSP: msg 0x%x msg_ext 0x%x",
+			msg, msg_ext);
+
+		/* Mask Done interrupt */
+		dsp_update_bits(adsp_data, HDA_DSP_BAR,
+				HDA_DSP_REG_HIPCCTL,
+				HDA_DSP_REG_HIPCCTL_DONE,
+				0);
+
+#if 0
+		if (!kfifo_is_empty(&adsp_data->tx_fifo)) {
+			u8 buf[mb_slot_len];
+			unsigned int len;
+
+			len = kfifo_out(&adsp_data->tx_fifo, buf, sizeof(buf));
+			if (len < sizeof(buf)) {
+				/* Should not happen */
+				dev_warn(dev, "Got from tx_fifo %u need %zu",
+					 len, sizeof(buf));
+			}
+
+			/* TODO: Should we zero full buffer and send */
+
+			/* Send more data to DSP mailbox */
+			ipm_write(adsp_data, buf, len);
+
+			clear_dsp_done(adsp_data);
+		} else {
+			dev_dbg(dev, "tx_fifo is empty, not enabling new ints");
+		}
+#endif
+		schedule_work(&adsp_data->writer_work);
+
+		/* Notify blocked writes */
+		wake_up_interruptible(&adsp_data->tx_fifo_not_full);
+	}
+
+	/* Is this a new message from DSP */
+	if (hipct & HDA_DSP_REG_HIPCT_BUSY) {
+		u8 buf[mb_slot_len];
+		msg = hipct & HDA_DSP_REG_HIPCT_MSG_MASK;
+		msg_ext = hipcte & HDA_DSP_REG_HIPCTE_MSG_MASK;
+
+		dev_dbg(dev, "New message from DSP: msg 0x%x msg_ext 0x%x",
+			msg, msg_ext);
+
+		/* Mask BUSY interrupt */
+		dsp_update_bits(adsp_data, HDA_DSP_BAR,
+				HDA_DSP_REG_HIPCCTL,
+				HDA_DSP_REG_HIPCCTL_BUSY, 0);
+
+		/* TODO: Correct data read size */
+		mailbox_read(adsp_data, buf, sizeof(buf));
+
+		print_hex_dump(KERN_INFO, "", DUMP_PREFIX_ADDRESS, 16, 1,
+			       buf, sizeof(buf), false);
+
+		/* Put read data to kfifo */
+		kfifo_in(&adsp_data->rx_fifo, buf, sizeof(buf));
+
+		if (kfifo_len(&adsp_data->rx_fifo) <= fifo_size - mb_slot_len) {
+			dev_dbg(dev, "Enable more interrupts, clear BUSY");
+			clear_dsp_busy(adsp_data);
+		} else {
+			dev_dbg(dev, "RX FIFO full");
+		}
+
+		/* Notify blocked readers that RX FIFO is not empty now */
+		wake_up_interruptible(&adsp_data->rx_fifo_not_empty);
+	}
+
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t interrupt_thread(int irq, void *context)
+{
+	struct adsp_data *adsp_data = context;
+	u32 status = dsp_read(adsp_data, HDA_DSP_BAR, HDA_DSP_REG_ADSPIS);
+	struct device *dev = adsp_data->dev;
+
+	if (status & HDA_DSP_ADSPIS_IPC) {
+		/* IPC IPM interrupt */
+		dev_dbg(dev, "Handle mailbox interrupt");
+
+		ipc_irq_thread(irq, context);
+	}
+
+	/* Enable GIE interrupt */
+	dsp_update_bits(adsp_data, HDA_DSP_HDA_BAR,
+			SOF_HDA_INTCTL,
+			SOF_HDA_INT_GLOBAL_EN,
+			SOF_HDA_INT_GLOBAL_EN);
+
+	return IRQ_HANDLED;
+}
+
+/**
+ * Character device to handle mailbox
+ */
+
+static void mb_writer_work(struct work_struct *work)
+{
+	struct adsp_data *adsp_data = container_of(work, struct adsp_data,
+						   writer_work);
+	u8 buf[mb_slot_len];
+	unsigned int len;
+
+	pr_devel("writer_work(): adsp_data %p tx_fifo len %u",
+		 adsp_data, kfifo_len(&adsp_data->tx_fifo));
+
+	if (kfifo_is_empty(&adsp_data->tx_fifo)) {
+		pr_err("tx_fifo is empty");
+		return;
+	}
+
+	len = kfifo_out(&adsp_data->tx_fifo, buf, sizeof(buf));
+	if (len < sizeof(buf)) {
+		/* Should not happen */
+		pr_warn("Got from tx_fifo %u need %zu", len, sizeof(buf));
+	}
+
+	/* Send more data to DSP mailbox */
+	ipm_write(adsp_data, buf, len);
+
+	clear_dsp_done(adsp_data);
+}
+
+static int init_mb_data(struct adsp_data *adsp_data)
+{
+	int ret;
+
+	pr_devel("%s: adsp_data %p", __func__, adsp_data);
+
+	if (kfifo_alloc(&adsp_data->rx_fifo, fifo_size, GFP_KERNEL)) {
+		ret = -ENOMEM;
+		goto rx_fifo_fail;
+	}
+
+	if (kfifo_alloc(&adsp_data->tx_fifo, fifo_size, GFP_KERNEL)) {
+		ret = -ENOMEM;
+		goto tx_fifo_fail;
+	}
+
+	init_waitqueue_head(&adsp_data->rx_fifo_not_empty);
+	init_waitqueue_head(&adsp_data->tx_fifo_not_full);
+	INIT_WORK(&adsp_data->writer_work, mb_writer_work);
+
+	return 0;
+
+tx_fifo_fail:
+	kfifo_free(&adsp_data->tx_fifo);
+rx_fifo_fail:
+	return ret;
+}
+
+static void mb_free_data(struct adsp_data *adsp_data)
+{
+	pr_devel("%s: adsp_data %p", __func__, adsp_data);
+
+	cancel_work_sync(&adsp_data->writer_work);
+
+	kfifo_free(&adsp_data->rx_fifo);
+	kfifo_free(&adsp_data->tx_fifo);
+}
+
+static ssize_t mb_read(struct file *filp, char *buffer, size_t length,
+		       loff_t *offset)
+{
+	struct adsp_data *adsp_data = filp->private_data;
+	unsigned int read;
+
+	pr_devel("read(): trying to read %zu bytes (rx_fifo len %u)", length,
+		 kfifo_len(&adsp_data->rx_fifo));
+
+	/* TODO: add locks */
+
+	if (kfifo_is_empty(&adsp_data->rx_fifo)) {
+		pr_devel("RX fifo empty");
+		if (filp->f_flags & O_NONBLOCK) {
+			pr_devel("read(): try again");
+			return -EAGAIN;
+		}
+
+		pr_devel("read(): Going to sleep on rx_fifo_not_empty");
+
+		if (wait_event_interruptible(adsp_data->rx_fifo_not_empty,
+					!kfifo_is_empty(&adsp_data->rx_fifo))) {
+			read = -ERESTARTSYS;
+		}
+	}
+
+	if (kfifo_to_user(&adsp_data->rx_fifo, buffer, length, &read))
+		return -EFAULT;
+
+	pr_devel("read(): read %d bytes (rx_fifo len %u)", read,
+		 kfifo_len(&adsp_data->rx_fifo));
+
+	if (kfifo_len(&adsp_data->rx_fifo) <= fifo_size - mb_slot_len) {
+		/* We can fit more data to fifo, clear DSP busy */
+		pr_devel("Enable more data, clearing DSP BUSY");
+		clear_dsp_busy(adsp_data);
+	}
+
+	return read;
+}
+
+static ssize_t mb_write(struct file *filp, const char *buffer, size_t length,
+			loff_t *offset)
+{
+	struct adsp_data *adsp_data = filp->private_data;
+	unsigned int written;
+
+	pr_devel("write(): trying to write %zu bytes (tx_fifo len %u)",
+		 length, kfifo_len(&adsp_data->tx_fifo));
+
+	/* TODO: add locks */
+
+	if (kfifo_is_full(&adsp_data->tx_fifo)) {
+		if (filp->f_flags & O_NONBLOCK)
+			return -EAGAIN;
+
+		pr_devel("write(): sleep until fifo is not full");
+
+		if (wait_event_interruptible(adsp_data->tx_fifo_not_full,
+					!kfifo_is_full(&adsp_data->tx_fifo))) {
+			return -ERESTARTSYS;
+		}
+	}
+
+	if (kfifo_from_user(&adsp_data->tx_fifo, buffer, length, &written))
+		return -EFAULT;
+
+	pr_devel("write(): written %u bytes", written);
+
+	if (!kfifo_is_empty(&adsp_data->tx_fifo)) {
+		/* Schedule writer work */
+		schedule_work(&adsp_data->writer_work);
+	}
+
+	return written;
+}
+
+static int mb_open(struct inode *inode, struct file *filp)
+{
+	struct adsp_data *adsp_data = container_of(inode->i_cdev,
+						   struct adsp_data, mb_cdev);
+	filp->private_data = adsp_data;
+
+	pr_info("open(): adsp_data %p", adsp_data);
+
+	return 0;
+}
+
+static int mb_release(struct inode *inode, struct file *filp)
+{
+	pr_info("close request");
+
+	return 0;
+}
+
+static const struct file_operations mb_fops = {
+	.read = mb_read,
+	.write = mb_write,
+	.open = mb_open,
+	.release = mb_release,
+};
+
+static int mbdev_setup(struct adsp_data *adsp_data)
+{
+	setup_cdev(&adsp_data->mb_cdev, MAJOR(driver.dev_num),
+		   MINOR(driver.dev_num) + DIAG_MB, &mb_fops);
+
+	if (IS_ERR(device_create(driver.cls, NULL, adsp_data->mb_cdev.dev,
+				 NULL, "mbox"))) {
+		pr_crit("Unable to create and register device");
+		return -1;
+	}
+
+	init_mb_data(adsp_data);
+
+	return 0;
+}
+
+void mbdev_release(struct adsp_data *adsp_data)
+{
+	pr_devel("%s: adsp_data %p", __func__, adsp_data);
+
+	device_destroy(driver.cls, adsp_data->mb_cdev.dev);
+	cdev_del(&adsp_data->mb_cdev);
+}
+
+static int sof_pci_probe(struct pci_dev *pci,
+			 const struct pci_device_id *pci_id)
+{
+	struct device *dev = &pci->dev;
+	struct adsp_data *adsp_data;
+	int ret;
+
+	dev_dbg(dev, "PCI device probe: %p", dev);
+
+	adsp_data = devm_kzalloc(dev, sizeof(*adsp_data), GFP_KERNEL);
+	if (!adsp_data)
+		return -ENOMEM;
+
+	pci_set_drvdata(pci, adsp_data);
+	dev_set_drvdata(dev, adsp_data);
+	adsp_data->dev = dev;
+
+	ret = pci_enable_device(pci);
+	if (ret < 0) {
+		dev_err(dev, "PCI device enable failed");
+		return ret;
+	}
+
+	ret = pci_request_regions(pci, "SOF PCI");
+	if (ret < 0) {
+		dev_err(dev, "PCI device request regions failed");
+		goto release_request_regions;
+	}
+
+	ret = pci_alloc_irq_vectors(pci, 1, 1, PCI_IRQ_MSI);
+	if (ret > 0) {
+		dev_dbg(dev, "Use MSI interrupt mode");
+		adsp_data->irq = pci_irq_vector(pci, 0);
+	} else {
+		dev_dbg(dev, "Use Legacy interrupt mode");
+		adsp_data->irq = pci->irq;
+	}
+
+	/* HDA base remap */
+	adsp_data->bar[HDA_DSP_HDA_BAR] = pci_ioremap_bar(pci, HDA_DSP_HDA_BAR);
+	if (!adsp_data->bar[HDA_DSP_HDA_BAR]) {
+		ret = -EIO;
+		dev_err(dev, "Cannot ioremap() memory");
+		goto release_unmap1;
+	}
+
+	/* DSP base */
+	adsp_data->bar[HDA_DSP_BAR] = pci_ioremap_bar(pci, HDA_DSP_BAR);
+	if (!adsp_data->bar[HDA_DSP_BAR]) {
+		ret = -EIO;
+		dev_err(dev, "Cannot ioremap() memory");
+		goto release_unmap2;
+	}
+
+	ret = request_threaded_irq(adsp_data->irq, interrupt_handler,
+				   interrupt_thread, IRQF_SHARED,
+				   "IPC doorbell", adsp_data);
+	if (ret < 0) {
+		dev_err(dev, "Can't get IRQ %d, error %d", adsp_data->irq, ret);
+		goto release_irq;
+	}
+
+	/* Entry point for the diagnostic driver interface */
+	diagdev_init();
+
+
+	ret = device_create_file(dev, &dev_attr_test_init);
+	dev_dbg(dev, "device_create_file returns %d", ret);
+
+	mbdev_setup(adsp_data);
+
+	enable_interrupts(adsp_data);
+
+	return 0;
+
+release_irq:
+	iounmap(adsp_data->bar[HDA_DSP_BAR]);
+release_unmap1:
+	iounmap(adsp_data->bar[HDA_DSP_HDA_BAR]);
+release_unmap2:
+	pci_release_regions(pci);
+release_request_regions:
+	pci_disable_device(pci);
+	devm_kfree(dev, adsp_data);
+
+	return ret;
+}
+
+static void sof_pci_remove(struct pci_dev *pci)
+{
+	struct adsp_data *adsp_data = pci_get_drvdata(pci);
+	struct device *dev = &pci->dev;
+
+	dev_dbg(dev, "PCI device removing: %p", dev);
+
+	device_remove_file(dev, &dev_attr_test_init);
+
+	mbdev_release(adsp_data);
+
+	diagdev_exit();
+
+	iounmap(adsp_data->bar[HDA_DSP_HDA_BAR]);
+	iounmap(adsp_data->bar[HDA_DSP_BAR]);
+
+	free_irq(adsp_data->irq, adsp_data);
+	pci_free_irq_vectors(pci);
+
+	/* release pci regions and disable device */
+	pci_release_regions(pci);
+
+	mb_free_data(adsp_data);
+
+	//kfree(adsp_data);
+}
+
+/* PCI IDs */
+static const struct pci_device_id sof_pci_ids[] = {
+	/* BXT-P & Apollolake */
+	{
+		PCI_DEVICE(0x8086, 0x5a98),
+	},
+	{
+		PCI_DEVICE(0x8086, 0x1a98),
+	},
+	{ 0, }
+};
+MODULE_DEVICE_TABLE(pci, sof_pci_ids);
+
+/* pci_driver definition */
+static struct pci_driver sof_pci_driver = {
+	.name = "sof-pci",
+	.id_table = sof_pci_ids,
+	.probe = sof_pci_probe,
+	.remove = sof_pci_remove,
+};
+module_pci_driver(sof_pci_driver);
+
+MODULE_AUTHOR("Intel");
+MODULE_DESCRIPTION("Diagnostic HDA Driver");
+MODULE_LICENSE("GPL");
